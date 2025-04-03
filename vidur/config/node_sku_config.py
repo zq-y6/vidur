@@ -60,3 +60,12 @@ class H100DgxNodeSKUConfig(BaseNodeSKUConfig):
     @staticmethod
     def get_type():
         return NodeSKUType.H100_DGX
+
+@dataclass
+class A100HgxNodeSKUConfig(BaseNodeSKUConfig):
+    device_sku_type: DeviceSKUType = DeviceSKUType.A100
+    num_devices_per_node: int = 8
+
+    @staticmethod
+    def get_type():
+        return NodeSKUType.A100_HGX

@@ -447,7 +447,7 @@ class ReplicaConfig:
         metadata={"help": "Device."},
     )
     network_device: str = field(
-        default="a100_pairwise_nvlink",
+        default="a100_hgx",
         metadata={"help": "Network device."},
     )
 

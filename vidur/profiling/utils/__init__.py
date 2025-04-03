@@ -4,6 +4,12 @@ from itertools import product
 from math import floor
 from typing import List
 
+import sys
+from pathlib import Path
+script_dir = Path(__file__).resolve().parent
+sarathi_path = script_dir.parents[2] / "sarathi-serve"
+sys.path.append(str(sarathi_path))
+
 import torch
 from sarathi.config import ParallelConfig
 

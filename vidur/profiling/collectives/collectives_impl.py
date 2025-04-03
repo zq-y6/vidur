@@ -59,6 +59,9 @@ class GraphedCollective:
     def _run_reduce_scatter(self):
         torch.distributed.reduce_scatter_tensor(self._buffer, self._reduce_buffer)
 
+    def _run_crypto_ring_all_reduce(self):
+        print("TO BE IMPLEMENTED")
+
     def _get_collective_fn(self, collective: str) -> Callable:
         if collective == "all_reduce":
             return self._run_all_reduce
