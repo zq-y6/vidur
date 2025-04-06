@@ -36,7 +36,7 @@ def parse_args():
     parser.add_argument(
         "--collective",
         default="all_reduce",
-        choices=["all_reduce", "send_recv"],
+        choices=["all_reduce", "send_recv", "my_ring_all_reduce"],
         help="Collective to profile",
     )
     args = parser.parse_args()

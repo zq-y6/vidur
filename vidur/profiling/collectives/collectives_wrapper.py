@@ -36,7 +36,7 @@ class CollectiveWrapper:
 
         self.timer_stats_store = TimerStatsStore(profile_method="kineto")
         self._cuda_timer = CudaTimer(
-            collective, aggregation_fn=np.median, filter_str="nccl"
+            collective, aggregation_fn=np.median, filter_str=["nccl", "extension_cpp"]
         )
 
     def _run_collective(self):

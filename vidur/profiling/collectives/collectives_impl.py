@@ -1,6 +1,7 @@
 from typing import Callable
 
 import torch
+import extension_cpp
 
 WARMUP_STEPS = 5
 GRAPH_STEPS = 3
@@ -37,6 +38,12 @@ class GraphedCollective:
                 dtype=dtype,
                 device="cuda",
             )
+        elif collective == "my_ring_all_reduce":
+            self._iv = torch.empty(size=(3,), dtype=torch.uint32, device="cuda")
+            self._rek = torch.empty(size=(56,), dtype=torch.uint32, device="cuda")
+            nonsecure_size = int(2 * size * self._buffer.element_size() / self._iv.element_size())
+            self._nonsecure_buffer = torch.empty(size=(nonsecure_size,), dtype=torch.uint32, device="cuda")
+            self._ct = torch.empty_like(self._nonsecure_buffer)
 
         if not self._disable_graph:
             self._graph = self._build_graph()
@@ -59,8 +66,25 @@ class GraphedCollective:
     def _run_reduce_scatter(self):
         torch.distributed.reduce_scatter_tensor(self._buffer, self._reduce_buffer)
 
-    def _run_crypto_ring_all_reduce(self):
-        print("TO BE IMPLEMENTED")
+    def _run_my_ring_all_reduce(self):
+        # Initially, we want to write our own ring all reduce, but soon we find it is too slow to invoke so many functions.
+        #
+        # So, here we emulate (n - 1) serialized encryptions, and (n - 1) serialized decryptions. Note that since the encryption
+        # and decryption can be done in parallel in ring all reduce, we also do them in parallel. We also have a memory copy
+        # that copies the tensor from secure memory into the non-secure memory region so that NVLink can directly access the
+        # encrypted tensor in the non-secure memory region (Refer to Nvidia H100 whitepaper).
+        #
+        # TODO: Need to learn more about NCCL internals for further optimization and a more reasonable encrypted baseline...
+        # If uni-directional NVLink is 300GBps, bidirectional is 600GBps, and the encryption is 200GBps, then the overall BW is
+        # 150GBps (4x slower).
+
+        # Use all possible GPU resources for encryption in parallel
+        buffer_uint32 = self._buffer.view(torch.uint32)     # 2048 --> 1024 * float16 --> 512 * uint32
+        self._nonsecure_buffer[:buffer_uint32.numel()] = buffer_uint32
+        self._nonsecure_buffer[buffer_uint32.numel():] = buffer_uint32
+        for i in range(torch.distributed.get_world_size() - 1):
+            torch.ops.extension_cpp.my_paralell_aes_encrypt(self._nonsecure_buffer, self._ct, self._iv, self._rek)
+        torch.distributed.all_reduce(self._ct[:buffer_uint32.numel()].view(self._buffer.dtype))
 
     def _get_collective_fn(self, collective: str) -> Callable:
         if collective == "all_reduce":
@@ -73,6 +97,8 @@ class GraphedCollective:
             return self._run_send_recv
         elif collective == "reduce_scatter":
             return self._run_reduce_scatter
+        elif collective == "my_ring_all_reduce":
+            return self._run_my_ring_all_reduce
         else:
             raise ValueError(f"Unknown collective: {collective}")
 
