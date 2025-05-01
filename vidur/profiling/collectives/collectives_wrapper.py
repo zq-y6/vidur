@@ -34,9 +34,48 @@ class CollectiveWrapper:
             num_workers, size, collective=collective, disable_graph=DISABLE_GRAPH
         )
 
+        def my_median(events):
+            groups = []
+            nccl_pool = []
+            aes_pool = []
+            gf_pool = []
+
+            for e in events:
+                name = e.name.lower()
+                if "nccl" in name:
+                    nccl_pool.append(e.cuda_time_total)
+                elif "aes" in name:
+                    aes_pool.append(e.cuda_time_total)
+                elif "gf" in name:
+                    gf_pool.append(e.cuda_time_total)
+
+                # Try to form a group as long as there is at least 1 NCCL
+                while len(nccl_pool) >= 1:
+                    nccl_time = nccl_pool.pop(0)
+                    group_sum = nccl_time
+
+                    # Add AES times if 4 are available
+                    if len(aes_pool) >= 1:
+                        assert len(aes_pool) >= 4
+                        group_sum += sum(aes_pool[:4])
+                        aes_pool = aes_pool[4:]
+
+                    # Add GF times if 4 are available
+                    if len(gf_pool) >= 1:
+                        assert len(gf_pool) >= 4
+                        group_sum += sum(gf_pool[:4])
+                        gf_pool = gf_pool[4:]
+
+                    groups.append(group_sum)
+
+            if not groups:
+                raise ValueError("No valid groups formed with at least 1 NCCL op.")
+
+            return np.median(groups)
+
         self.timer_stats_store = TimerStatsStore(profile_method="kineto")
         self._cuda_timer = CudaTimer(
-            collective, aggregation_fn=np.median, filter_str=["nccl", "extension_cpp"]
+            collective, aggregation_fn=my_median, filter_str=["nccl", "extension_cpp"], complex=True
         )
 
     def _run_collective(self):

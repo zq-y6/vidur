@@ -14,6 +14,7 @@ class CudaTimer:
         layer_id: int = 0,  # we don't care about layer id, it is just for compatibility with sarathi cudatimer
         aggregation_fn=sum,
         filter_str=None,
+        complex=False
     ):
         if name:
             # beautify the names we get from vllm
@@ -30,6 +31,7 @@ class CudaTimer:
             return
 
         self.aggregation_fn = aggregation_fn
+        self.complex = complex
         self.filter_str = filter_str
 
         if self.timer_stats_store.profile_method == ProfileMethod.KINETO:
@@ -71,7 +73,10 @@ class CudaTimer:
         if self.filter_str:
             events = [e for e in events if any(e.name.startswith(prefix) for prefix in self.filter_str)]
 
-        total_cuda_time = self.aggregation_fn([e.cuda_time_total for e in events])
+        if self.complex:
+            total_cuda_time = self.aggregation_fn(events)
+        else:
+            total_cuda_time = self.aggregation_fn([e.cuda_time_total for e in events])
         self.timer_stats_store.record_time(
             self.name, total_cuda_time * 1e-3
         )  # convert to ms

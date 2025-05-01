@@ -40,10 +40,18 @@ class GraphedCollective:
             )
         elif collective == "my_ring_all_reduce":
             self._iv = torch.empty(size=(3,), dtype=torch.uint32, device="cuda")
+            buffer_size_in_uint32 = size * self._buffer.element_size() / self._iv.element_size()
             self._rek = torch.empty(size=(56,), dtype=torch.uint32, device="cuda")
-            nonsecure_size = int(2 * size * self._buffer.element_size() / self._iv.element_size())
-            self._nonsecure_buffer = torch.empty(size=(nonsecure_size,), dtype=torch.uint32, device="cuda")
-            self._ct = torch.empty_like(self._nonsecure_buffer)
+            self._ct = torch.empty(size=(int(2 * buffer_size_in_uint32),), dtype=torch.uint32, device="cuda")   # top half for ciphertext, bottom for sig
+            self._pt = torch.empty(size=(int(2 * buffer_size_in_uint32),), dtype=torch.uint32, device="cuda")   # top half for plaintext, bottom for auth
+            self._nw = num_workers
+            self._h = torch.randint(
+                low=0,
+                high=2**32,
+                size=(2,),
+                dtype=torch.uint64,
+                device="cuda"
+            )
 
         if not self._disable_graph:
             self._graph = self._build_graph()
@@ -67,9 +75,10 @@ class GraphedCollective:
         torch.distributed.reduce_scatter_tensor(self._buffer, self._reduce_buffer)
 
     def _run_my_ring_all_reduce(self):
-        # Initially, we want to write our own ring all reduce, but soon we find it is too slow to invoke so many functions.
+        # Initially, we want to write our own ring all reduce (https://github.com/NVIDIA/nccl/blob/master/src/device/all_reduce.h),
+        # but soon we find it is too slow to invoke so many send receive functions from python.
         #
-        # So, here we emulate (n - 1) serialized encryptions, and (n - 1) serialized decryptions. Note that since the encryption
+        # So, here we emulate 2 serialized encryptions, and 2 serialized decryptions. Note that since the encryption
         # and decryption can be done in parallel in ring all reduce, we also do them in parallel. We also have a memory copy
         # that copies the tensor from secure memory into the non-secure memory region so that NVLink can directly access the
         # encrypted tensor in the non-secure memory region (Refer to Nvidia H100 whitepaper).
@@ -77,14 +86,26 @@ class GraphedCollective:
         # TODO: Need to learn more about NCCL internals for further optimization and a more reasonable encrypted baseline...
         # If uni-directional NVLink is 300GBps, bidirectional is 600GBps, and the encryption is 200GBps, then the overall BW is
         # 150GBps (4x slower).
+        # TODO: should be 128-byte cacheline aligned !!! For each warp (32 threads)
 
         # Use all possible GPU resources for encryption in parallel
-        buffer_uint32 = self._buffer.view(torch.uint32)     # 2048 --> 1024 * float16 --> 512 * uint32
-        self._nonsecure_buffer[:buffer_uint32.numel()] = buffer_uint32
-        self._nonsecure_buffer[buffer_uint32.numel():] = buffer_uint32
-        for i in range(torch.distributed.get_world_size() - 1):
-            torch.ops.extension_cpp.my_paralell_aes_encrypt(self._nonsecure_buffer, self._ct, self._iv, self._rek)
-        torch.distributed.all_reduce(self._ct[:buffer_uint32.numel()].view(self._buffer.dtype))
+        blength = self._buffer.shape[0]
+        bsplit_index = (self._nw - 1) * blength // self._nw
+        pclength = self._pt.shape[0] // 2
+        pcsplit_index = (self._nw - 1) * pclength // self._nw
+        for i in range(2):  # This is the overall encrypted data of ring-all-reduce (throughput-oriented), 2(ngpu - 1)(sz/ngpu)
+            torch.ops.extension_cpp.my_paralell_aes_encrypt(self._buffer[:bsplit_index].view(torch.uint32), self._ct[:pcsplit_index], self._iv, self._rek) # encryption
+            torch.ops.extension_cpp.my_paralell_aes_encrypt(self._buffer[:bsplit_index].view(torch.uint32), self._pt[:pcsplit_index], self._iv, self._rek) # decryption (should be parallel to encryption ideally, but since each cuda operator can easily saturate SMs, it doesn't matter so much)
+
+        # In each step, each GPU operates on total/ngpu data for integrity protection, and there are 2(ngpu - 1) rounds. In each round, the signature and authentication should be parallel.
+        nblock = 1
+        signum_in_uint32 = (self._ct.numel() // 2) // nblock
+        nblock_for_all_comm = nblock * (self._nw - 1)   # There are 2(ngpu - 1) comm that cannot run in parallel
+        for i in range(2):
+            torch.ops.extension_cpp.my_paralell_gf128mul(self._ct[:pcsplit_index].view(torch.uint64), self._h, self._ct[self._ct.numel() // 2:].view(torch.uint64), nblock_for_all_comm)  # sign
+            torch.ops.extension_cpp.my_paralell_gf128mul(self._pt[:pcsplit_index].view(torch.uint64), self._h, self._pt[self._pt.numel() // 2:].view(torch.uint64), nblock_for_all_comm)  # auth
+
+        torch.distributed.all_reduce(self._ct[:(self._ct.numel() // 2) - 1 + signum_in_uint32].view(self._buffer.dtype))    # a tradeoff between par and NVLink consumption
 
     def _get_collective_fn(self, collective: str) -> Callable:
         if collective == "all_reduce":

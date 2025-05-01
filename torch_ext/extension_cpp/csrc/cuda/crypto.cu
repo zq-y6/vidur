@@ -5,7 +5,7 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 
-#include <stdio.h>
+// #include <stdio.h>
 
 namespace extension_cpp {
 
@@ -525,8 +525,71 @@ at::Tensor my_paralell_aes_encrypt_cuda(const at::Tensor& pt, at::Tensor& ct, co
   return ct;
 }
 
+// Carryless multiplication (uses XOR instead of Addition) for integrity and authentication
+__device__ uint64_t clmul64(uint64_t x, uint64_t y) {
+  uint64_t result = 0;
+  for (int i = 0; i < 64; ++i) {
+    if (y & (1ULL << i))
+      result ^= (x << i);
+  }
+  return result;
+}
+
+// We now use a0 for the low part of the 128-bit block, a1 for the high pert
+__device__ void gf128_mul_raw(uint64_t a0, uint64_t a1, uint64_t h0, uint64_t h1, uint64_t *res0, uint64_t *res1) {
+  uint64_t z00 = clmul64(a0, h0); // low × low
+  uint64_t z01 = clmul64(a0, h1); // low × high
+  uint64_t z10 = clmul64(a1, h0); // high × low
+  uint64_t z11 = clmul64(a1, h1); // high × high
+  uint64_t mid1 = z01 ^ z10;
+  *res0 = z00;
+  *res1 = z11 ^ mid1;
+}
+
+__global__ void gf128mul_kernel(const uint64_t *msg, const uint64_t *h, uint64_t *hashv, int nblock, int total_bn) {
+  int x = blockIdx.x * blockDim.x + threadIdx.x;
+  int y = blockIdx.y * blockDim.y + threadIdx.y;
+
+  int index = x + y * gridDim.x * blockDim.x; /* The block index */
+
+  const uint64_t *msg_start_addr = (uint64_t *)((uint64_t)msg + 128 / 8 * nblock * index);
+  uint64_t *hashv_start_addr = (uint64_t *)((uint64_t)hashv + 128 / 8 * index);
+  const int this_thread_nblock = ((index + 1) * nblock <= total_bn) ? nblock : (total_bn % nblock);    /* A very small branch won't hurt much */
+
+  *hashv_start_addr = 0;
+  *(hashv_start_addr + 1) = 0;
+
+  for (int i = 0; i < this_thread_nblock; i++)
+    gf128_mul_raw(*(msg_start_addr + 2 * i) ^ *hashv_start_addr, *(msg_start_addr + 2 * i + 1) ^ *(hashv_start_addr + 1), *h, *(h + 1), hashv_start_addr, hashv_start_addr + 1);
+}
+
+at::Tensor my_paralell_gf128mul_cuda(const at::Tensor& msg, const at::Tensor& h, at::Tensor& hashv, int64_t nblock) {
+  TORCH_CHECK(msg.nbytes() % 16 == 0 && msg.nbytes() != 0);   // 128-bit (block size) aligned ciphertext
+  TORCH_CHECK(h.nbytes() == 16);      // 128-bit value for gf128mul
+  TORCH_CHECK(msg.nbytes() <= nblock * hashv.nbytes());
+  TORCH_CHECK(msg.is_contiguous());
+  TORCH_CHECK(h.is_contiguous());
+  TORCH_CHECK(hashv.is_contiguous());
+  TORCH_CHECK(msg.dtype() == at::kUInt64);
+  TORCH_CHECK(hashv.dtype() == at::kUInt64);
+  TORCH_CHECK(h.dtype() == at::kUInt64);
+  TORCH_INTERNAL_ASSERT(msg.device().type() == at::DeviceType::CUDA);
+  TORCH_INTERNAL_ASSERT(h.device().type() == at::DeviceType::CUDA);
+  TORCH_INTERNAL_ASSERT(hashv.device().type() == at::DeviceType::CUDA);
+  const uint64_t* msg_ptr = msg.data_ptr<uint64_t>();   // Pytorch will check nullptr internally when calling the data_ptr() method
+  const uint64_t* h_ptr = h.data_ptr<uint64_t>();
+  uint64_t* hashv_ptr = hashv.data_ptr<uint64_t>();
+  const int max_threads_per_block = 256;
+  int total = (msg.nbytes() / 16 + nblock - 1) / nblock;
+  int threads = (total <= max_threads_per_block) ? total : max_threads_per_block;
+  int blocks = (total + max_threads_per_block - 1) / max_threads_per_block;
+  gf128mul_kernel<<<blocks, threads>>>(msg_ptr, h_ptr, hashv_ptr, nblock, msg.nbytes() / 16);
+  return hashv;
+}
+
 TORCH_LIBRARY_IMPL(extension_cpp, CUDA, m) {
   m.impl("my_paralell_aes_encrypt", &my_paralell_aes_encrypt_cuda);
+  m.impl("my_paralell_gf128mul", &my_paralell_gf128mul_cuda);
 }
 
 }

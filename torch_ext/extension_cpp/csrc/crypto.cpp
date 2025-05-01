@@ -29,6 +29,7 @@ namespace extension_cpp {
 // Defines the operators
 TORCH_LIBRARY(extension_cpp, m) {
   m.def("my_paralell_aes_encrypt(Tensor pt, Tensor ct, Tensor iv, Tensor rek) -> Tensor");
+  m.def("my_paralell_gf128mul(Tensor msg, Tensor h, Tensor hashv, int nblock) -> Tensor");
 }
 
 }

@@ -1,5 +1,9 @@
 #! /bin/bash
 
+# test 0
+gcc clmul.c -o clmul
+./clmul
+
 # test 1
 python aes.py
 
